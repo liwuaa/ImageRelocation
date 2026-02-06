@@ -10,7 +10,11 @@ from scipy.spatial.transform import Rotation as R
 from flask import Flask, request, jsonify
 from threading import Lock
 from collections import OrderedDict
-from AlgorithmClass import AdvancedGeometryStrategy, BaseMatchingStrategy, OriginalRansacStrategy
+from AlgorithmClass import (
+    AdvancedGeometryStrategy,
+    BaseMatchingStrategy,
+    OriginalRansacStrategy,
+)
 
 
 # --- 工具类 ---
@@ -178,12 +182,13 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 # 选项 B: AdvancedGeometryStrategy() - 基础矩阵+密度校验版
 # CURRENT_STRATEGY = OriginalRansacStrategy()
 CURRENT_STRATEGY = AdvancedGeometryStrategy()
-relocator = OptimizedRTABMapRelocator("66.db", CURRENT_STRATEGY)
+relocator = OptimizedRTABMapRelocator("2_5.db", CURRENT_STRATEGY)
 
 
 def save_matched_images_with_features(
     query_image_data, map_node_id, query_keypoints, matches
 ):
+    
     conn = sqlite3.connect(relocator.m_dbPath)
     cursor = conn.cursor()
     cursor.execute("SELECT image FROM Data WHERE id = ?", (map_node_id,))
@@ -191,19 +196,66 @@ def save_matched_images_with_features(
     conn.close()
     if not row:
         return
-    query_img = cv2.imdecode(
-        np.frombuffer(query_image_data, np.uint8), cv2.IMREAD_COLOR
-    )
+    # 1. 解码原始图像
+    query_img = cv2.imdecode(np.frombuffer(query_image_data, np.uint8), cv2.IMREAD_COLOR)
+    # 从数据库读取地图图像 (参考 relocator.m_dbPath)
     map_img = cv2.imdecode(np.frombuffer(row[0], np.uint8), cv2.IMREAD_COLOR)
-    map_kp = relocator.map_features_cache[map_node_id]["keypoints"]
-    combined = cv2.drawMatches(query_img, query_keypoints, map_img, map_kp, matches, None, flags=2)  # type: ignore
-    path=os.path.join(TEMP_DIR, f"matched_{map_node_id}_{int(time.time()*1000)}.jpg")
-    cv2.imwrite(
-        path,
-        combined,
-    )
-    print(path)
 
+    if query_img is None or map_img is None:
+        return
+
+    # 获取地图节点缓存的特征点
+    map_kp = relocator.map_features_cache[map_node_id]["keypoints"]
+
+    # --- 第一阶段：在各自的原始图片上标记特征点 ---
+    
+    # 复制图片，避免修改原始像素数据
+    q_canvas = query_img.copy()
+    m_canvas = map_img.copy()
+
+    for match in matches:
+        # 获取匹配对的原始坐标
+        q_pt_raw = (int(query_keypoints[match.queryIdx].pt[0]), int(query_keypoints[match.queryIdx].pt[1]))
+        m_pt_raw = (int(map_kp[match.trainIdx].pt[0]), int(map_kp[match.trainIdx].pt[1]))
+
+        # 分别绘制红色(Query)和蓝色(Map)点
+        cv2.circle(q_canvas, q_pt_raw, 5, (0, 0, 255), -1)
+        cv2.circle(m_canvas, m_pt_raw, 5, (255, 0, 0), -1)
+
+    # --- 第二阶段：水平拼接处理过的图片 ---
+    
+    h1, w1 = q_canvas.shape[:2]
+    h2, w2 = m_canvas.shape[:2]
+    
+    # 保持高度统一（以两图中的最大高度为基准）
+    vis_h = max(h1, h2)
+    vis_w = w1 + w2
+    vis = np.zeros((vis_h, vis_w, 3), dtype=np.uint8)
+
+    # 放置图片
+    vis[:h1, :w1] = q_canvas
+    vis[:h2, w1:w1+w2] = m_canvas
+
+    # --- 第三阶段：绘制跨图连接线 ---
+
+    for match in matches:
+        # 左图坐标保持不变
+        q_pt = (int(query_keypoints[match.queryIdx].pt[0]), int(query_keypoints[match.queryIdx].pt[1]))
+        # 右图坐标需要加上左图宽度偏移 w1
+        m_pt = (int(map_kp[match.trainIdx].pt[0]) + w1, int(map_kp[match.trainIdx].pt[1]))
+
+        # 绘制黄色匹配线 (AA抗锯齿)
+        cv2.line(vis, q_pt, m_pt, (0, 255, 255), 1, cv2.LINE_AA)
+
+    # --- 辅助信息绘制 ---
+    # 使用半透明黑色矩形背景增强文字可读性
+    cv2.rectangle(vis, (0, 0), (220, 80), (0, 0, 0), -1)
+    cv2.putText(vis, f"Matches: {len(matches)}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1)
+    cv2.putText(vis, f"Node ID: {map_node_id}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1)
+
+    # 保存结果
+    path = os.path.join(TEMP_DIR, f"matched_{map_node_id}_{int(time.time()*1000)}.jpg")
+    cv2.imwrite(path, vis)
 
 @app.route("/get_position", methods=["POST"])
 def get_position():
@@ -211,7 +263,7 @@ def get_position():
         print("-------------***********----------------")
         data = request.get_json()
         image_data = base64.b64decode(data["image"])
-        
+
         # 调用算法策略获取结果
         result = relocator.find_location_from_bytes(image_data)
         print(result["status"])
@@ -219,28 +271,40 @@ def get_position():
         # 处理图片匹配结果与可视化保存
         if result["status"] == "Success":
             # 仅在匹配成功时保存匹配图片
-            if 'node_id' in result and 'query_keypoints' in result and 'best_matches' in result:
+            if (
+                "node_id" in result
+                and "query_keypoints" in result
+                and "best_matches" in result
+            ):
                 save_matched_images_with_features(
                     image_data,
                     result["node_id"],
                     result["query_keypoints"],
                     result["best_matches"],
                 )
-            print(f"SUCCESS: NodeID {result.get('node_id', 'N/A')} | Conf {result.get('confidence', 'N/A')}")
+            print(
+                f"SUCCESS: NodeID {result.get('node_id', 'N/A')} | Conf {result.get('confidence', 'N/A')}"
+            )
         elif result["status"] == "LowConfidence":
-            print(f"LOW CONFIDENCE: Conf {result.get('confidence', 'N/A')} | Inliers: {result.get('match_count', 'N/A')}")
+            print(
+                f"LOW CONFIDENCE: Conf {result.get('confidence', 'N/A')} | Inliers: {result.get('match_count', 'N/A')}"
+            )
         else:
-            print(f"FAILED: {result.get('message')} | Inliers: {result.get('match_count', 'N/A')}")
+            print(
+                f"FAILED: {result.get('message')} | Inliers: {result.get('match_count', 'N/A')}"
+            )
 
         # --- 还原回你原来的响应格式 ---
         newResult = {
             "status": result["status"],  # 业务状态（Success、LowConfidence 或 Failed）
-            "confidence": result['confidence'], # 这里 result['confidence'] 已经是带 % 的字符串了
+            "confidence": result[
+                "confidence"
+            ],  # 这里 result['confidence'] 已经是带 % 的字符串了
             "match_count": result.get("match_count", 0),
             "unity_pos": result.get("unity_pos", {}),
             "unity_quat": result.get("unity_quat", {}),
         }
-        
+
         print("*********************************\n")
         # 接口状态总是200 OK，业务状态由 result 中的 status 字段表示
         # message 字段包含序列化后的业务数据字符串
@@ -255,10 +319,11 @@ def get_position():
             "match_count": 0,
             "unity_pos": {},
             "unity_quat": {},
-            "message": f"Exception occurred: {str(e)}"
+            "message": f"Exception occurred: {str(e)}",
         }
         print("*********************************\n")
         return jsonify({"status": "Failed", "message": str(error_info)})
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
